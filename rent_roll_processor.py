@@ -9,6 +9,7 @@ from pathlib import Path
 import warnings
 from dataclasses import dataclass
 from collections import defaultdict
+import os
 
 # Configure logging
 logging.basicConfig(level=logging.INFO,
@@ -459,6 +460,129 @@ class RentRollProcessor:
             for col in unmapped_columns:
                 logger.warning(f"  - {col}")
 
+    def _extract_metadata(self, df: pd.DataFrame, max_rows: int = 5) -> Dict[str, str]:
+        """Extract metadata from the top rows of the rent roll."""
+        metadata = {}
+        
+        try:
+            # Look for metadata in the first few rows
+            for idx in range(min(max_rows, len(df))):
+                row = df.iloc[idx]
+                row_str = ' '.join(str(x) for x in row if pd.notna(x)).lower()
+                
+                # Extract property name
+                if 'apartments' in row_str or 'manor' in row_str:
+                    metadata['property_name'] = ' '.join(str(x) for x in row if pd.notna(x))
+                
+                # Extract date information
+                if 'as of' in row_str:
+                    date_parts = row_str.split('as of')
+                    if len(date_parts) > 1:
+                        metadata['as_of_date'] = date_parts[1].strip()
+                
+                # Extract month/year
+                if 'month' in row_str and 'year' in row_str:
+                    try:
+                        metadata['report_period'] = row_str.split('=')[-1].strip()
+                    except:
+                        # If split fails, use the whole string
+                        metadata['report_period'] = row_str.strip()
+        except Exception as e:
+            logger.warning(f"Error extracting metadata: {str(e)}")
+            
+        return metadata
+
+    def _handle_multi_row_headers(self, df: pd.DataFrame) -> Tuple[pd.DataFrame, Dict[str, str]]:
+        """
+        Handle multi-row headers in rent roll.
+        Returns cleaned DataFrame and header mapping.
+        """
+        # Find the main header row (usually contains Unit, Type, etc.)
+        header_row = None
+        header_mapping = {}
+        
+        # Skip metadata rows (usually first 3-4 rows)
+        start_idx = 3
+        
+        for idx in range(start_idx, min(20, len(df))):
+            row = df.iloc[idx]
+            row_str = ' '.join(str(x) for x in row if pd.notna(x)).lower()
+            
+            # Look for key header indicators with more specific patterns
+            if ('unit' in row_str and any(x in row_str for x in ['type', 'resident', 'rent'])):
+                header_candidates = idx
+                
+                # Check next row for sub-headers
+                if idx + 1 < len(df):
+                    next_row = df.iloc[idx + 1]
+                    
+                    # Combine headers if needed
+                    headers = []
+                    for col1, col2 in zip(row, next_row):
+                        col1_str = str(col1) if pd.notna(col1) else ''
+                        col2_str = str(col2) if pd.notna(col2) else ''
+                        
+                        if col1_str and col2_str:
+                            # Both rows have values, combine them
+                            headers.append(f"{col1_str} {col2_str}".strip())
+                        elif col1_str:
+                            headers.append(col1_str.strip())
+                        elif col2_str:
+                            headers.append(col2_str.strip())
+                        else:
+                            headers.append('')
+                    
+                    # Create mapping, filtering out empty headers
+                    header_mapping = {i: h for i, h in enumerate(headers) if h and not h.startswith('Unnamed')}
+                    header_row = idx
+                    break
+        
+        if header_row is not None:
+            # Skip the header rows and rename columns
+            df = df.iloc[header_row + 2:].reset_index(drop=True)
+            df.columns = range(len(df.columns))
+            df = df.rename(columns=header_mapping)
+            
+            # Remove any remaining unnamed columns
+            unnamed_cols = [col for col in df.columns if isinstance(col, int) or str(col).startswith('Unnamed')]
+            df = df.drop(columns=unnamed_cols)
+            
+            # Clean up the data - remove any rows that are actually headers or metadata
+            df = df[~df.iloc[:, 0].astype(str).str.contains('current|notice|vacant|total', case=False)]
+        else:
+            logger.warning("Could not find proper header row, using first row as header")
+            df = df.iloc[0:].reset_index(drop=True)
+        
+        return df, header_mapping
+
+    def _handle_sections(self, df: pd.DataFrame) -> pd.DataFrame:
+        """Handle different sections in the rent roll (Current/Notice/Vacant)."""
+        # Identify section rows
+        section_rows = []
+        current_section = None
+        
+        for idx, row in df.iterrows():
+            row_str = ' '.join(str(x) for x in row if pd.notna(x)).lower()
+            
+            # Look for section headers
+            if any(section in row_str for section in ['current', 'notice', 'vacant']):
+                section_rows.append(idx)
+                if 'current' in row_str:
+                    current_section = 'Current'
+                elif 'notice' in row_str:
+                    current_section = 'Notice'
+                elif 'vacant' in row_str:
+                    current_section = 'Vacant'
+            
+            # Add section information if we're tracking sections
+            if current_section and not row_str.startswith(('current', 'notice', 'vacant')):
+                df.loc[idx, 'Section'] = current_section
+        
+        # Remove section header rows
+        df = df.drop(section_rows)
+        
+        return df
+
     def process_file(self, file_path: str, sheet_name: Optional[str] = None,
                     validate: bool = True) -> pd.DataFrame:
         """
@@ -467,12 +591,38 @@ class RentRollProcessor:
         logger.info(f"Processing file: {file_path}")
         
         try:
-            # Handle different file types
-            if file_path.lower().endswith('.csv'):
-                self.df = pd.read_csv(file_path)
-            else:
-                self.df, header_row = self._preprocess_excel(file_path, sheet_name)
-                logger.info(f"Found header row at index: {header_row}")
+            # First, get the Excel file object to check sheets
+            excel_file = pd.ExcelFile(file_path)
+            available_sheets = excel_file.sheet_names
+            logger.info(f"Available sheets: {available_sheets}")
+
+            # If no sheet specified, try to find the most relevant one
+            if sheet_name is None:
+                sheet_scores = {}
+                for sheet in available_sheets:
+                    score = sum(1 for keyword in ['rent', 'roll', 'unit', 'tenant']
+                              if keyword.lower() in sheet.lower())
+                    sheet_scores[sheet] = score
+                
+                sheet_name = available_sheets[0]  # Default to first sheet
+                if sheet_scores:
+                    sheet_name = max(sheet_scores.items(), key=lambda x: x[1])[0]
+                logger.info(f"Selected sheet: {sheet_name}")
+
+            # Read the selected sheet
+            raw_df = pd.read_excel(file_path, sheet_name=sheet_name, header=None)
+            
+            # Extract metadata
+            metadata = self._extract_metadata(raw_df)
+            logger.info("\nExtracted Metadata:")
+            for key, value in metadata.items():
+                logger.info(f"  - {key}: {value}")
+            
+            # Handle multi-row headers
+            self.df, header_mapping = self._handle_multi_row_headers(raw_df)
+            
+            # Handle sections
+            self.df = self._handle_sections(self.df)
             
             # Clean and standardize data
             self.df = self._clean_and_standardize_data(self.df)
@@ -484,6 +634,11 @@ class RentRollProcessor:
                 logger.info(f"  - {orig} -> {mapped}")
             
             self.df = self.df.rename(columns=mapped_cols)
+            
+            # Add metadata as additional columns
+            if metadata:
+                for key, value in metadata.items():
+                    self.df[f'metadata_{key}'] = value
             
             # Validate data if requested
             if validate:
@@ -507,14 +662,38 @@ class RentRollProcessor:
         if self.df is None:
             raise ValueError("No data to export. Please process a file first.")
         
-        writer = pd.ExcelWriter(output_path, engine='xlsxwriter')
+        # Ensure the output directory exists
+        output_dir = os.path.dirname(os.path.abspath(output_path))
+        os.makedirs(output_dir, exist_ok=True)
         
-        # Write main data
-        self.df.to_excel(writer, sheet_name='Processed Rent Roll', index=False)
-        self._format_excel_output(writer, 'Processed Rent Roll')
+        # Try to find an available filename if the target file is locked
+        base_name, ext = os.path.splitext(output_path)
+        counter = 1
+        while True:
+            try:
+                writer = pd.ExcelWriter(output_path, engine='xlsxwriter')
+                break
+            except PermissionError:
+                output_path = f"{base_name}_{counter}{ext}"
+                counter += 1
+                if counter > 100:  # Prevent infinite loop
+                    raise ValueError("Unable to find available filename for export")
         
-        writer.close()
-        logger.info(f"\nData exported to {output_path}")
+        try:
+            # Write main data
+            self.df.to_excel(writer, sheet_name='Processed Rent Roll', index=False)
+            self._format_excel_output(writer, 'Processed Rent Roll')
+            writer.close()
+            logger.info(f"\nData exported to {output_path}")
+        except Exception as e:
+            logger.error(f"Error exporting to Excel: {str(e)}")
+            try:
+                # Fallback: Try to save without formatting
+                self.df.to_excel(output_path, index=False)
+                logger.info(f"\nData exported to {output_path} (without formatting)")
+            except Exception as e2:
+                logger.error(f"Fallback export also failed: {str(e2)}")
+                raise
 
     def _format_excel_output(self, writer: pd.ExcelWriter, sheet_name: str):
         """Apply advanced Excel formatting."""
@@ -657,13 +836,15 @@ if __name__ == "__main__":
         processor = RentRollProcessor()
         
         # Process the rent roll file
-        file_path = r"e:\Downloads\Abbie Lakes - Rent Roll - 5.15.24 (Lender Pulled) ajr.xlsx"
+        file_path = r"E:\Lenguard\Rent Roll_Marlon Manor_3.7.2023.xlsx"
         logger.info(f"Processing file: {file_path}")
         
         df = processor.process_file(file_path, validate=True)
         
-        # Export processed data
-        processor.export_to_excel("processed_rent_roll.xlsx")
+        # Export processed data with timestamp to avoid conflicts
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        output_path = f"processed_rent_roll_{timestamp}.xlsx"
+        processor.export_to_excel(output_path)
         
     except Exception as e:
         logger.error(f"Error processing rent roll: {str(e)}", exc_info=True) 
