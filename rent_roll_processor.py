@@ -1,7 +1,7 @@
 import pandas as pd
 import numpy as np
 from datetime import datetime
-from fuzzywuzzy import fuzz
+from rapidfuzz import fuzz, process
 from typing import Dict, List, Optional, Tuple, Any
 import re
 import logging
@@ -329,11 +329,15 @@ class RentRollProcessor:
                 matches += 1
                 continue
             
-            # Check for fuzzy matches
-            for variant in all_variants:
-                if fuzz.ratio(cell_str, variant) > 80:
-                    matches += 0.8
-                    break
+            # Check for fuzzy matches using rapidfuzz
+            best_match = process.extractOne(
+                cell_str,
+                all_variants,
+                scorer=fuzz.ratio,
+                score_cutoff=80
+            )
+            if best_match:
+                matches += 0.8
         
         return matches / len(self.column_configs)
 
@@ -409,6 +413,52 @@ class RentRollProcessor:
         logger.info("Data quality metrics calculated")
         return metrics
 
+    def print_validation_errors(self):
+        """Print validation errors in a formatted way."""
+        if not self.validation_errors:
+            logger.info("No validation errors found.")
+            return
+
+        logger.warning("\n=== Validation Errors ===")
+        for col, errors in self.validation_errors.items():
+            logger.warning(f"\nColumn: {col}")
+            for error in errors:
+                logger.warning(f"  - {error}")
+
+    def print_data_quality_metrics(self):
+        """Print data quality metrics in a formatted way."""
+        if not self.data_quality_metrics:
+            logger.info("No data quality metrics available.")
+            return
+
+        logger.info("\n=== Data Quality Metrics ===")
+        
+        # Print basic metrics
+        logger.info(f"\nBasic Metrics:")
+        logger.info(f"  - Total rows processed: {self.data_quality_metrics['total_rows']}")
+        logger.info(f"  - Duplicate rows: {self.data_quality_metrics['duplicate_rows']}")
+        logger.info(f"  - Data completeness: {self.data_quality_metrics['completeness_ratio']:.2%}")
+        
+        # Print column statistics
+        logger.info(f"\nColumn Statistics:")
+        logger.info(f"  - Total columns found: {len(self.data_quality_metrics['columns_found'])}")
+        logger.info(f"  - Successfully mapped columns: {len(self.data_quality_metrics['columns_mapped'])}")
+        
+        # Print missing values by column
+        logger.info(f"\nMissing Values by Column:")
+        missing_values = self.data_quality_metrics['missing_values_by_column']
+        for col, count in missing_values.items():
+            if count > 0:
+                percentage = (count / self.data_quality_metrics['total_rows']) * 100
+                logger.info(f"  - {col}: {count} missing values ({percentage:.1f}%)")
+
+        # Print unmapped columns
+        unmapped_columns = set(self.data_quality_metrics['columns_found']) - set(self.data_quality_metrics['columns_mapped'])
+        if unmapped_columns:
+            logger.warning(f"\nUnmapped Columns:")
+            for col in unmapped_columns:
+                logger.warning(f"  - {col}")
+
     def process_file(self, file_path: str, sheet_name: Optional[str] = None,
                     validate: bool = True) -> pd.DataFrame:
         """
@@ -429,22 +479,20 @@ class RentRollProcessor:
             
             # Map columns
             mapped_cols = self._fuzzy_match_columns(self.df.columns)
-            logger.info("Column mapping:")
+            logger.info("\nColumn Mapping Results:")
             for orig, mapped in mapped_cols.items():
-                logger.info(f"{orig} -> {mapped}")
+                logger.info(f"  - {orig} -> {mapped}")
             
             self.df = self.df.rename(columns=mapped_cols)
             
             # Validate data if requested
             if validate:
                 is_valid = self._validate_data(self.df)
-                if not is_valid:
-                    logger.warning("Validation errors found:")
-                    for col, errors in self.validation_errors.items():
-                        logger.warning(f"{col}: {', '.join(errors)}")
+                self.print_validation_errors()
             
-            # Calculate quality metrics
+            # Calculate and print quality metrics
             self._calculate_data_quality_metrics()
+            self.print_data_quality_metrics()
             
             return self.df
             
@@ -452,10 +500,9 @@ class RentRollProcessor:
             logger.error(f"Error processing file: {str(e)}")
             raise
 
-    def export_to_excel(self, output_path: str, include_validation: bool = True,
-                       include_metrics: bool = True) -> None:
+    def export_to_excel(self, output_path: str) -> None:
         """
-        Export processed data to Excel with enhanced formatting and optional validation report.
+        Export processed data to Excel with enhanced formatting.
         """
         if self.df is None:
             raise ValueError("No data to export. Please process a file first.")
@@ -466,25 +513,8 @@ class RentRollProcessor:
         self.df.to_excel(writer, sheet_name='Processed Rent Roll', index=False)
         self._format_excel_output(writer, 'Processed Rent Roll')
         
-        # Add validation errors if any
-        if include_validation and self.validation_errors:
-            validation_df = pd.DataFrame([
-                {'Column': col, 'Error': err}
-                for col, errors in self.validation_errors.items()
-                for err in errors
-            ])
-            validation_df.to_excel(writer, sheet_name='Validation Errors', index=False)
-        
-        # Add data quality metrics
-        if include_metrics and self.data_quality_metrics:
-            metrics_df = pd.DataFrame([
-                {'Metric': k, 'Value': str(v)}
-                for k, v in self.data_quality_metrics.items()
-            ])
-            metrics_df.to_excel(writer, sheet_name='Data Quality Metrics', index=False)
-        
         writer.close()
-        logger.info(f"Data exported to {output_path}")
+        logger.info(f"\nData exported to {output_path}")
 
     def _format_excel_output(self, writer: pd.ExcelWriter, sheet_name: str):
         """Apply advanced Excel formatting."""
@@ -568,26 +598,31 @@ class RentRollProcessor:
         # Second pass: Try fuzzy matching for remaining columns
         for col in unmapped_cols:
             col_lower = str(col).lower().strip()
-            best_match = None
-            highest_score = 0
             
+            # Create a list of all possible matches (standard names and variants)
+            all_possible_matches = []
             for config_name, config in self.column_configs.items():
-                # Skip if this standard name is already mapped
-                if config.standard_name in mapped_cols.values():
-                    continue
-                
-                # Try matching against standard name and variants
-                for variant in [config.standard_name] + config.variants:
-                    score = fuzz.ratio(col_lower, variant.lower())
-                    if score > highest_score and score > 80:  # 80% similarity threshold
-                        highest_score = score
-                        best_match = config.standard_name
+                if config.standard_name not in mapped_cols.values():  # Skip if already mapped
+                    all_possible_matches.extend([(variant, config.standard_name) 
+                                              for variant in [config.standard_name] + config.variants])
             
-            if best_match:
-                mapped_cols[col] = best_match
-                logger.info(f"Fuzzy matched '{col}' to '{best_match}' with score {highest_score}")
-            else:
-                logger.warning(f"Could not match column '{col}' to any standard column")
+            # Use rapidfuzz to find the best match
+            if all_possible_matches:
+                choices, standard_names = zip(*all_possible_matches)
+                best_match = process.extractOne(
+                    col_lower,
+                    choices,
+                    scorer=fuzz.ratio,
+                    score_cutoff=80
+                )
+                
+                if best_match:
+                    match_idx = choices.index(best_match[0])
+                    standard_name = standard_names[match_idx]
+                    mapped_cols[col] = standard_name
+                    logger.info(f"Fuzzy matched '{col}' to '{standard_name}' with score {best_match[1]}")
+                else:
+                    logger.warning(f"Could not match column '{col}' to any standard column")
         
         return mapped_cols
 
@@ -618,7 +653,7 @@ class RentRollProcessor:
 # Example usage
 if __name__ == "__main__":
     try:
-        # Initialize processor with optional template
+        # Initialize processor
         processor = RentRollProcessor()
         
         # Process the rent roll file
@@ -627,26 +662,8 @@ if __name__ == "__main__":
         
         df = processor.process_file(file_path, validate=True)
         
-        # Export with validation report and metrics
-        processor.export_to_excel(
-            "processed_rent_roll.xlsx",
-            include_validation=True,
-            include_metrics=True
-        )
+        # Export processed data
+        processor.export_to_excel("processed_rent_roll.xlsx")
         
-        # Log results
-        logger.info("\nProcessing completed successfully!")
-        logger.info(f"Total units processed: {len(df)}")
-        logger.info(f"Columns standardized: {', '.join(df.columns)}")
-        
-        if processor.validation_errors:
-            logger.warning("\nValidation errors found:")
-            for col, errors in processor.validation_errors.items():
-                logger.warning(f"{col}: {', '.join(errors)}")
-        
-        logger.info("\nData quality metrics:")
-        for metric, value in processor.data_quality_metrics.items():
-            logger.info(f"{metric}: {value}")
-            
     except Exception as e:
         logger.error(f"Error processing rent roll: {str(e)}", exc_info=True) 
