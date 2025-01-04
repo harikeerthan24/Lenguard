@@ -1,2 +1,7 @@
-.venv
-~$processed_rent_roll.xlsx
+.env
+__pycache__/
+*.pyc
+.venv/
+html_outputs/
+*.xlsx
+~$*
