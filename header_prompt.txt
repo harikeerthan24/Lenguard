@@ -1,0 +1,26 @@
+-Analyze these rows from a rent roll spreadsheet and identify which row contains the column headers of the rent roll data.
+
+A header row typically contains multiple of these terms:
+- Unit ID, Tenant ID, Resident, Name
+
+- Rent, Lease, Move-in, Move-out
+
+- Deposit, Balance, Charges
+
+- Floor Plan, Status
+
+- Dep On Hand ,EMPLCRED ,Email ,LOP15 ,Lease End ,Lease ID ,Lease Start ,Market + Addl. ,Move-In ,Move-Out ,Notice For Date ,OHIOCHOICE ,PEST ,PETRENT ,Phone Number ,RENT ,Resh ID ,SETUPFEE ,TRASH ,Total Charges ,Unit ,Unit Designation ,Unit/Lease Status ,VALET TRASH ,WAIVED ADMIN FEE ,WAIVED APP FEE
+
+- Actual ,Expiration ,Market ,Move In ,Move Out ,Other ,Sq Ft ,Unit Type
+
+- BD/BA ,Entire Lease Term Concessions  NCP ,Lease From ,Lease To ,Market Rent ,Parking ,Pet Fee ,Property ,Tenant ,Total
+
+- Sq Ft
+
+- Resident Other
+
+- Premiums  NCP
+Sample rows:
+{sample_text}
+
+Return ONLY the row number (e.g., "5") that contains the headers.
